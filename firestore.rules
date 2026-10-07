@@ -1,0 +1,213 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    // Hardcoded fallback owner (bootstraps the first superadmin, and is a
+    // recovery path if the users/ doc for the owner is ever corrupted) —
+    // same convention used in the PDFSign app's rules.
+    function isHardcodedOwner() { return isSignedIn() && request.auth.token.email == 'v.carmel@gmail.com'; }
+
+    function adminDocRef() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function isAdminUser() { return isSignedIn() && exists(adminDocRef()); }
+    function adminData() { return get(adminDocRef()).data; }
+    function isSuperAdmin() { return isHardcodedOwner() || (isAdminUser() && adminData().active == true && adminData().role == 'superadmin'); }
+    function isManager() { return isAdminUser() && adminData().active == true && adminData().role == 'manager'; }
+    function isManagerOfDept(deptId) { return isManager() && deptId in adminData().departmentIds; }
+    function isAdminOrManagerOfDept(deptId) { return isSuperAdmin() || isManagerOfDept(deptId); }
+
+    function employeeDocRef(employeeId) { return /databases/$(database)/documents/employees/$(employeeId); }
+    function isEmployeeSelf(employeeId) {
+      return isSignedIn()
+        && exists(employeeDocRef(employeeId))
+        && get(employeeDocRef(employeeId)).data.uid == request.auth.uid
+        && get(employeeDocRef(employeeId)).data.portalActive != false;
+    }
+
+    // A map can only gain keys, never lose or change one it already had —
+    // ported from PDFSign's exact proven pattern for letting concurrent
+    // anonymous signers additively merge into a shared multi-sign round
+    // without a transaction race letting one overwrite another's data.
+    function additiveMapUpdate(beforeMap, afterMap) {
+      let d = beforeMap.diff(afterMap);
+      return d.removedKeys().size() == 0 && d.changedKeys().size() == 0;
+    }
+
+    match /users/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isSuperAdmin());
+      allow write: if isSuperAdmin();
+      // Self-service carve-out: any signed-in admin/manager can flip their own
+      // email-MFA flag without needing superadmin (matches the self-service
+      // display-name pattern already used for the owner).
+      allow update: if isSignedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['mfaEmailEnabled']);
+    }
+
+    match /departments/{deptId} {
+      allow read: if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    match /fieldDefs/{fieldId} {
+      allow read: if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    match /settings/{docId} {
+      allow read: if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    match /employees/{employeeId} {
+      allow read: if isAdminOrManagerOfDept(resource.data.departmentId) || isEmployeeSelf(employeeId);
+      allow create: if isAdminOrManagerOfDept(request.resource.data.departmentId);
+      // Editing requires authority over the employee's CURRENT department; a
+      // department-changing edit additionally requires authority over the
+      // NEW department too (AND, not OR) - otherwise any manager could pull
+      // an employee from a department they have no relationship to into
+      // their own just by rewriting departmentId in the same write.
+      allow update: if isSuperAdmin()
+        || (isManagerOfDept(resource.data.departmentId)
+            && (request.resource.data.departmentId == resource.data.departmentId
+                || isManagerOfDept(request.resource.data.departmentId)));
+      allow delete: if isSuperAdmin();
+
+      match /equipment/{itemId} {
+        allow read: if isAdminOrManagerOfDept(get(employeeDocRef(employeeId)).data.departmentId) || isEmployeeSelf(employeeId);
+        allow write: if isAdminOrManagerOfDept(get(employeeDocRef(employeeId)).data.departmentId);
+      }
+      match /trainings/{itemId} {
+        allow read: if isAdminOrManagerOfDept(get(employeeDocRef(employeeId)).data.departmentId) || isEmployeeSelf(employeeId);
+        allow write: if isAdminOrManagerOfDept(get(employeeDocRef(employeeId)).data.departmentId);
+      }
+      match /notes/{itemId} {
+        allow read: if isAdminOrManagerOfDept(get(employeeDocRef(employeeId)).data.departmentId);
+        allow write: if isAdminOrManagerOfDept(get(employeeDocRef(employeeId)).data.departmentId);
+      }
+      match /documents/{itemId} {
+        allow read: if isAdminOrManagerOfDept(get(employeeDocRef(employeeId)).data.departmentId) || isEmployeeSelf(employeeId);
+        allow write: if isAdminOrManagerOfDept(get(employeeDocRef(employeeId)).data.departmentId);
+      }
+    }
+
+    match /templates/{templateId} {
+      // Any signed-in admin/manager can read (needed to list templates when
+      // sending one to an employee); only superadmin builds/edits templates.
+      allow read: if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    // Top-level (not nested under employees/) so the signing link is just
+    // ?req=<requestId> — the id itself is a long random token and is the
+    // real secret, same proven model as PDFSign's fill.html?id=...
+    match /signingRequests/{requestId} {
+      allow read: if isSignedIn();
+
+      allow create: if isAdminOrManagerOfDept(get(employeeDocRef(request.resource.data.employeeId)).data.departmentId);
+
+      // Recipient (anonymous auth) attempting the OTP code: always allowed to
+      // try (up to 5 times), otpVerified only flips true if the client-computed
+      // hash of what they typed matches the hash in signingSecrets/{requestId}
+      // — real server-side enforcement without a Cloud Function. The hash
+      // itself is never readable by the client (see signingSecrets below),
+      // only comparable via get() inside this rule — otherwise a client could
+      // read the hash and brute-force all 1,000,000 6-digit codes offline
+      // with no rate limit at all.
+      allow update: if resource.data.status == 'sent'
+        && resource.data.otpVerified == false
+        && resource.data.otpAttempts < 5
+        && request.resource.data.otpAttempts == resource.data.otpAttempts + 1
+        && request.resource.data.otpVerified == (request.resource.data.attemptHash == get(/databases/$(database)/documents/signingSecrets/$(requestId)).data.otpCodeHash)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['otpAttempts', 'otpVerified', 'attemptHash']);
+
+      // Recipient submitting the signed result, only once OTP-verified.
+      allow update: if resource.data.status == 'sent'
+        && resource.data.otpVerified == true
+        && request.resource.data.status == 'signed'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'values', 'signedAt']);
+
+      // Admin/manager management (e.g. marking a stale request expired).
+      allow update: if isAdminOrManagerOfDept(get(employeeDocRef(resource.data.employeeId)).data.departmentId);
+
+      allow delete: if isSuperAdmin();
+    }
+
+    // Holds only {otpCodeHash} per signing request. Never directly readable
+    // by anyone (including admins, from the client) — the rules above reach
+    // in via get() to compare a submitted hash server-side. This is what
+    // makes the OTP a real secret instead of a client-readable value that
+    // could be brute-forced offline with no rate limit.
+    match /signingSecrets/{requestId} {
+      allow read: if false;
+      allow create: if isSuperAdmin() || isManager();
+      allow update, delete: if false;
+    }
+
+    // Shared state for a multi-signer round (e.g. עובד + מנהל co-signing one
+    // document). Each role still gets its own signingRequests/{id} doc for
+    // its OTP-gated link (unchanged mechanics, reused as-is) - this doc holds
+    // the values/signatures all roles additively merge into, so a completed
+    // round can be flattened into one final PDF.
+    match /signingRounds/{roundId} {
+      allow read: if isSignedIn();
+      allow create: if isAdminOrManagerOfDept(get(employeeDocRef(request.resource.data.employeeId)).data.departmentId);
+
+      // Any signed-in (anonymous) role-signer additively merging their own
+      // contribution, or (the signer who completes the last role) flattening
+      // and finalizing. Mirrors PDFSign's isSignerPartialUpdate exactly.
+      allow update: if isSignedIn()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['values', 'signerNames', 'rawSignatures', 'status', 'completedAt', 'resultDocumentId'])
+        && (
+          (resource.data.status == 'in_progress'
+            && (request.resource.data.status == 'in_progress' || request.resource.data.status == 'completing')
+            && !('completedAt' in request.resource.data) && !('resultDocumentId' in request.resource.data)
+            && additiveMapUpdate(resource.data.values, request.resource.data.values)
+            && additiveMapUpdate(resource.data.signerNames, request.resource.data.signerNames)
+            && additiveMapUpdate(resource.data.rawSignatures, request.resource.data.rawSignatures))
+          ||
+          (resource.data.status == 'completing' && request.resource.data.status == 'completed'
+            && request.resource.data.values == resource.data.values
+            && request.resource.data.signerNames == resource.data.signerNames
+            && !('rawSignatures' in request.resource.data)
+            && request.resource.data.completedAt == request.time)
+        );
+
+      // Admin/manager management (e.g. marking stale, or promoting the final
+      // PDF into the employee's documents tab and recording resultDocumentId).
+      allow update: if isAdminOrManagerOfDept(get(employeeDocRef(resource.data.employeeId)).data.departmentId);
+      allow delete: if isSuperAdmin();
+    }
+
+    // Email-based two-factor login (custom, not Firebase's native phone MFA -
+    // that required more Google Cloud infrastructure than this project needed
+    // elsewhere: reCAPTCHA Enterprise, verified email precondition, etc; this
+    // reuses the exact hash-in-a-never-readable-doc pattern already proven
+    // above for signingSecrets/signingRequests, self-scoped to request.auth.uid
+    // instead of an anonymous token).
+    match /mfaEmailSecrets/{uid} {
+      allow read: if false;
+      allow write: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    match /mfaEmailChallenges/{uid} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+      allow create: if isSignedIn() && request.auth.uid == uid;
+
+      // Starting a fresh challenge (new code requested) - always allowed for
+      // self; the actual secret is a separate never-readable doc, so this
+      // alone can't be used to skip verification.
+      allow update: if isSignedIn() && request.auth.uid == uid
+        && request.resource.data.verified == false && request.resource.data.otpAttempts == 0;
+
+      // Attempting to verify a code - capped at 5 tries, verified only flips
+      // true if the submitted hash matches mfaEmailSecrets/{uid} via get().
+      allow update: if isSignedIn() && request.auth.uid == uid
+        && resource.data.verified == false
+        && resource.data.otpAttempts < 5
+        && request.resource.data.otpAttempts == resource.data.otpAttempts + 1
+        && request.resource.data.verified == (request.resource.data.attemptHash == get(/databases/$(database)/documents/mfaEmailSecrets/$(uid)).data.otpCodeHash)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['otpAttempts', 'verified', 'attemptHash']);
+    }
+  }
+}

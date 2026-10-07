@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HR-Manager | כניסה</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#2f6fed">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="card login-card" id="loginCard">
+    <h1>ניהול כוח אדם</h1>
+    <p class="muted" style="text-align:center">כניסה למערכת</p>
+    <div class="field">
+      <label>אימייל</label>
+      <input type="email" id="email" autocomplete="username">
+    </div>
+    <div class="field">
+      <label>סיסמה</label>
+      <input type="password" id="password" autocomplete="current-password">
+    </div>
+    <button class="btn primary" id="loginBtn" style="width:100%">כניסה</button>
+    <div class="error-msg" id="errorMsg"></div>
+    <p style="text-align:center;margin-top:10px">
+      <a href="#" id="forgotPasswordLink" style="font-size:13px">שכחתי סיסמה</a>
+    </p>
+  </div>
+
+  <div class="card login-card" id="mfaChallengeCard" style="display:none">
+    <h1>אימות דו-שלבי</h1>
+    <p class="muted" style="text-align:center">הוזן קוד שנשלח לכתובת האימייל שלך</p>
+    <div class="field">
+      <label>קוד אימות</label>
+      <input id="mfaCodeInput" inputmode="numeric" maxlength="6">
+    </div>
+    <button class="btn primary" id="mfaVerifyBtn" style="width:100%">אימות</button>
+    <div class="error-msg" id="mfaErrorMsg"></div>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-storage-compat.js"></script>
+<script src="js/firebase-init.js"></script>
+<script src="js/auth-common.js"></script>
+<script src="js/pdf-field-utils.js"></script>
+<script src="js/emailjs-config.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+const errorMsg = document.getElementById('errorMsg');
+if (params.get('denied') === '1') errorMsg.textContent = 'למשתמש זה אין הרשאת גישה למערכת.';
+
+document.getElementById('loginBtn').addEventListener('click', doLogin);
+document.getElementById('password').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+document.getElementById('forgotPasswordLink').addEventListener('click', async (e) => {
+  e.preventDefault();
+  const email = document.getElementById('email').value.trim();
+  if (!email) { errorMsg.textContent = 'נא להזין אימייל ולאחר מכן ללחוץ על "שכחתי סיסמה".'; return; }
+  try {
+    await auth.sendPasswordResetEmail(email);
+    errorMsg.style.color = 'var(--success)';
+    errorMsg.textContent = 'נשלח אימייל לאיפוס סיסמה.';
+  } catch (e2) {
+    errorMsg.style.color = '';
+    errorMsg.textContent = 'שגיאה בשליחת האימייל: ' + e2.message;
+  }
+});
+
+async function doLogin() {
+  errorMsg.textContent = '';
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  if (!email || !password) { errorMsg.textContent = 'נא למלא אימייל וסיסמה'; return; }
+  try {
+    // Deliberately doesn't act on cred.user itself - onAuthStateChanged below
+    // fires as a direct consequence of this call and is the single place that
+    // decides what happens next. Two independent code paths reacting to the
+    // same sign-in would race: this one could reach admin/portal.html before
+    // the MFA check below ever ran, defeating it entirely (unlike Firebase's
+    // native phone MFA, this app-level email MFA doesn't stop signInWith...
+    // from resolving - the gate only exists if we consistently apply it here).
+    await auth.signInWithEmailAndPassword(email, password);
+  } catch (e) {
+    errorMsg.textContent = 'אימייל או סיסמה שגויים.';
+  }
+}
+
+async function proceedAfterAuth(user) {
+  const info = await resolveCurrentUserRole(user);
+  if (!info) {
+    await auth.signOut();
+    errorMsg.textContent = 'למשתמש זה אין הרשאת גישה למערכת.';
+    return;
+  }
+  window.location.href = info.role === 'employee' ? 'portal.html' : 'admin.html';
+}
+
+let mfaChallengeUser = null;
+
+async function startMfaChallenge(user) {
+  mfaChallengeUser = user;
+  document.getElementById('loginCard').style.display = 'none';
+  document.getElementById('mfaChallengeCard').style.display = 'block';
+  const mfaErrorMsg = document.getElementById('mfaErrorMsg');
+  mfaErrorMsg.textContent = 'שולח קוד...';
+  try {
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const otpCodeHash = await sha256Hex(code);
+    await db.collection('mfaEmailSecrets').doc(user.uid).set({ otpCodeHash });
+    await db.collection('mfaEmailChallenges').doc(user.uid).set({
+      otpAttempts: 0, verified: false, createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    const emailed = await sendSigningEmail({
+      to_email: user.email, to_name: '', subject: 'קוד כניסה למערכת', link: '', otp_code: code
+    });
+    mfaErrorMsg.textContent = emailed ? '' : 'שגיאה בשליחת האימייל - יש לפנות למנהל המערכת.';
+  } catch (e2) {
+    mfaErrorMsg.textContent = 'שגיאה בשליחת קוד האימות: ' + e2.message;
+  }
+}
+
+document.getElementById('mfaVerifyBtn').addEventListener('click', async () => {
+  const mfaErrorMsg = document.getElementById('mfaErrorMsg');
+  const code = document.getElementById('mfaCodeInput').value.trim();
+  if (!/^\d{6}$/.test(code) || !mfaChallengeUser) { mfaErrorMsg.textContent = 'יש להזין קוד בן 6 ספרות.'; return; }
+
+  const attemptHash = await sha256Hex(code);
+  const challengeRef = db.collection('mfaEmailChallenges').doc(mfaChallengeUser.uid);
+  try {
+    await challengeRef.update({ otpAttempts: firebase.firestore.FieldValue.increment(1), verified: true, attemptHash });
+  } catch (e) {
+    try {
+      await challengeRef.update({ otpAttempts: firebase.firestore.FieldValue.increment(1), verified: false, attemptHash });
+    } catch (e2) { /* attempts exhausted */ }
+  }
+
+  const fresh = await challengeRef.get();
+  if (fresh.exists && fresh.data().verified) {
+    try { localStorage.setItem('mfaVerifiedAt_' + mfaChallengeUser.uid, String(Date.now())); } catch (e3) {}
+    await proceedAfterAuth(mfaChallengeUser);
+  } else {
+    mfaErrorMsg.textContent = 'קוד שגוי.' + (fresh.exists && fresh.data().otpAttempts >= 5 ? ' יותר מדי ניסיונות - יש לרענן את הדף ולהתחבר מחדש.' : '');
+  }
+});
+document.getElementById('mfaCodeInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('mfaVerifyBtn').click();
+});
+
+// Single entry point for anything that follows a sign-in: a fresh
+// email+password submission in this tab (doLogin), and an already-persisted
+// session from a previous visit (page load with a still-valid Firebase
+// session) both land here, since both are just auth-state changes to Firebase.
+// localStorage (survives browser restarts, unlike sessionStorage) tracks when
+// this browser last cleared the MFA challenge for this specific uid - Firebase
+// itself would otherwise keep the session signed in indefinitely, so without
+// this the "second factor" would only ever be checked once, ever.
+const MFA_REVALIDATE_DAYS = 30;
+auth.onAuthStateChanged(async (user) => {
+  if (!user) return;
+  const userDoc = await db.collection('users').doc(user.uid).get();
+  const mfaEnabled = userDoc.exists && userDoc.data().mfaEmailEnabled === true;
+  let lastVerifiedAt = 0;
+  try { lastVerifiedAt = Number(localStorage.getItem('mfaVerifiedAt_' + user.uid) || 0); } catch (e) {}
+  const daysSinceVerified = (Date.now() - lastVerifiedAt) / (1000 * 60 * 60 * 24);
+  if (mfaEnabled && daysSinceVerified >= MFA_REVALIDATE_DAYS) {
+    if (document.getElementById('mfaChallengeCard').style.display !== 'block') {
+      await startMfaChallenge(user);
+    }
+    return;
+  }
+  await proceedAfterAuth(user);
+});
+</script>
+</body>
+</html>

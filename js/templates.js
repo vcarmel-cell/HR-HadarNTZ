@@ -1,0 +1,581 @@
+let currentUser, currentUserName;
+let templates = [];
+let currentTemplateId = null;
+let currentFields = [];
+let currentPdfBytes = null;
+let selectedFieldId = null;
+let pageInfos = []; // { pageWidthPt, pageHeightPt, cssWidth, cssHeight }
+let pageCanvases = [];
+let activeFieldType = null;
+const FIELD_DEFAULT_SIZE_PX = { text: [140, 22], number: [90, 22], date: [110, 22], idNumber: [110, 22], phone: [120, 22], checkbox: [24, 24], signature: [180, 60] };
+const MAX_TEMPLATES = 20;
+const MAX_SUBMISSIONS_PER_TEMPLATE = 100;
+
+init();
+
+async function init() {
+  const info = await requireRole(['superadmin']);
+  currentUser = info.user;
+  currentUserName = info.name;
+  document.getElementById('whoAmI').textContent = currentUserName || currentUser.email;
+  document.getElementById('logoutBtn').addEventListener('click', () => auth.signOut().then(() => location.href = 'login.html'));
+
+  document.getElementById('newTemplateBtn').addEventListener('click', resetToNewTemplate);
+  document.getElementById('templateSelect').addEventListener('change', onSelectTemplate);
+  document.getElementById('tplFile').addEventListener('change', onFileChosen);
+  document.getElementById('saveTemplateBtn').addEventListener('click', saveTemplate);
+  document.getElementById('deleteTemplateBtn').addEventListener('click', deleteTemplate);
+  document.getElementById('applyFieldBtn').addEventListener('click', applyFieldForm);
+  document.getElementById('deleteFieldBtn').addEventListener('click', deleteSelectedField);
+
+  document.querySelectorAll('.tool-btn').forEach(btn => {
+    btn.addEventListener('click', () => setActiveTool(btn.dataset.type === activeFieldType ? null : btn.dataset.type));
+  });
+  document.getElementById('tplMultiSign').addEventListener('change', (e) => {
+    document.getElementById('multiSignHint').style.display = e.target.checked ? 'block' : 'none';
+  });
+  document.getElementById('aiDetectBtn').addEventListener('click', runAiDetect);
+  document.getElementById('closeSubmissionsModalBtn').addEventListener('click', closeSubmissionsModal);
+  document.getElementById('submissionsModalBackdrop').addEventListener('click', (e) => {
+    if (e.target.id === 'submissionsModalBackdrop') closeSubmissionsModal();
+  });
+
+  await loadPdfLib();
+  await loadTemplatesList();
+}
+
+function loadPdfLib() {
+  return new Promise((resolve, reject) => {
+    if (window.PDFLib) { resolve(); return; }
+    const s = document.createElement('script');
+    s.src = PDF_LIB_SCRIPT_URL;
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+async function loadTemplatesList() {
+  const snap = await db.collection('templates').where('active', '==', true).orderBy('name').get();
+  templates = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const sel = document.getElementById('templateSelect');
+  sel.innerHTML = '<option value="">-- תבנית חדשה --</option>' +
+    templates.map(t => `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');
+  await renderTemplatesTable();
+}
+
+// Mirrors admin.js's countTemplateSubmissions - one "submission" is one
+// single-mode send or one multi-sign round (not one per role).
+async function countTemplateSubmissions(templateId) {
+  const [singleSnap, roundsSnap] = await Promise.all([
+    db.collection('signingRequests').where('templateId', '==', templateId).where('mode', '==', 'single').get(),
+    db.collection('signingRounds').where('templateId', '==', templateId).get()
+  ]);
+  return singleSnap.size + roundsSnap.size;
+}
+
+async function renderTemplatesTable() {
+  const tbody = document.getElementById('templatesTbody');
+  document.getElementById('templatesEmpty').style.display = templates.length ? 'none' : 'block';
+  if (!templates.length) { tbody.innerHTML = ''; return; }
+
+  const counts = await Promise.all(templates.map(t => countTemplateSubmissions(t.id)));
+  tbody.innerHTML = templates.map((t, i) => `
+    <tr>
+      <td>${escapeHtml(t.name)}</td>
+      <td>${t.mode === 'multiSign' ? 'רב-חותמים' : 'יחיד'}</td>
+      <td>${t.pageCount || 0}</td>
+      <td>${(t.fields || []).length}</td>
+      <td><button class="btn small" data-view-submissions="${t.id}">${counts[i]} / ${MAX_SUBMISSIONS_PER_TEMPLATE}</button></td>
+      <td><button class="btn small" data-open-tpl="${t.id}">עריכה</button></td>
+    </tr>
+  `).join('');
+
+  tbody.querySelectorAll('[data-open-tpl]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.getElementById('templateSelect').value = btn.dataset.openTpl;
+      onSelectTemplate();
+      window.scrollTo({ top: document.getElementById('tplName').closest('.card').offsetTop - 10, behavior: 'smooth' });
+    });
+  });
+  tbody.querySelectorAll('[data-view-submissions]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const t = templates.find(x => x.id === btn.dataset.viewSubmissions);
+      openSubmissionsModal(t.id, t.name);
+    });
+  });
+}
+
+const SIGNING_STATUS_LABELS = { sent: 'ממתין', signed: 'נחתם', expired: 'פג תוקף' };
+const ROUND_STATUS_LABELS = { in_progress: 'בתהליך', completing: 'משלים...', completed: 'הושלם' };
+
+function closeSubmissionsModal() {
+  document.getElementById('submissionsModalBackdrop').style.display = 'none';
+}
+
+async function openSubmissionsModal(templateId, templateName) {
+  document.getElementById('submissionsModalTitle').textContent = `הגשות - ${templateName}`;
+  document.getElementById('submissionsModalBackdrop').style.display = 'flex';
+  await renderSubmissionsList(templateId);
+}
+
+async function renderSubmissionsList(templateId) {
+  const list = document.getElementById('submissionsList');
+  list.innerHTML = '<li class="muted">טוען...</li>';
+
+  const [singleSnap, roundsSnap] = await Promise.all([
+    db.collection('signingRequests').where('templateId', '==', templateId).where('mode', '==', 'single').orderBy('createdAt', 'desc').get(),
+    db.collection('signingRounds').where('templateId', '==', templateId).orderBy('createdAt', 'desc').get()
+  ]);
+
+  const singleRows = singleSnap.docs.map(d => {
+    const r = d.data();
+    const statusLabel = r.status === 'sent' && r.otpVerified ? 'בתהליך מילוי' : (SIGNING_STATUS_LABELS[r.status] || r.status);
+    return `<li>
+      <span>${escapeHtml(r.employeeName || '')} <span class="muted">· ${statusLabel}${r.recipientEmail ? ' · ' + escapeHtml(r.recipientEmail) : ''} ${r.createdAt ? '· ' + fmtDate(r.createdAt) : ''}</span></span>
+      <span>
+        ${r.status === 'signed' && !r.resultDocumentId ? `<button class="btn small" data-promote-single="${d.id}" data-emp="${r.employeeId}" data-empname="${escapeHtml(r.employeeName || '')}">הוספה לתיק המסמכים</button>` : ''}
+        ${r.status === 'signed' && r.resultDocumentId ? '<span class="badge active">נוסף לתיק</span>' : ''}
+      </span>
+    </li>`;
+  });
+
+  const roundRows = roundsSnap.docs.map(d => {
+    const r = d.data();
+    const totalRoles = (r.roles || []).length;
+    const summary = r.status === 'in_progress'
+      ? `${Object.keys(r.signerNames || {}).length}/${totalRoles} חתמו`
+      : (ROUND_STATUS_LABELS[r.status] || r.status);
+    return `<li>
+      <span>${escapeHtml(r.employeeName || '')} <span class="muted">· רב-חותמים · ${summary} ${r.createdAt ? '· ' + fmtDate(r.createdAt) : ''}</span></span>
+      <span>
+        ${r.status === 'completed' && !r.resultDocumentId ? `<button class="btn small" data-promote-round="${d.id}" data-emp="${r.employeeId}" data-empname="${escapeHtml(r.employeeName || '')}">הוספה לתיק המסמכים</button>` : ''}
+        ${r.status === 'completed' && r.resultDocumentId ? '<span class="badge active">נוסף לתיק</span>' : ''}
+      </span>
+    </li>`;
+  });
+
+  list.innerHTML = singleRows.join('') + roundRows.join('') || '<li class="muted">אין הגשות עדיין</li>';
+
+  list.querySelectorAll('[data-promote-single]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      await promoteSignedSingleFromTemplate(btn.dataset.emp, btn.dataset.promoteSingle, btn.dataset.empname);
+      await renderSubmissionsList(templateId);
+      await renderTemplatesTable();
+    });
+  });
+  list.querySelectorAll('[data-promote-round]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      await promoteSignedRoundFromTemplate(btn.dataset.emp, btn.dataset.promoteRound, btn.dataset.empname);
+      await renderSubmissionsList(templateId);
+      await renderTemplatesTable();
+    });
+  });
+}
+
+async function promoteSignedSingleFromTemplate(employeeId, requestId, employeeName) {
+  try {
+    const reqDoc = await db.collection('signingRequests').doc(requestId).get();
+    const r = reqDoc.data();
+    const url = await storage.ref(`signingRequests/${requestId}/signed.pdf`).getDownloadURL();
+    const blob = await (await fetch(url)).blob();
+
+    const docRef = db.collection('employees').doc(employeeId).collection('documents').doc();
+    const destPath = `documents/${employeeId}/${docRef.id}_signed.pdf`;
+    await storage.ref(destPath).put(blob);
+    await docRef.set({
+      name: `${r.templateName} (חתום)`, storagePath: destPath, contentType: 'application/pdf', sizeBytes: blob.size,
+      uploadedAt: firebase.firestore.FieldValue.serverTimestamp(), uploadedBy: currentUserName || currentUser.email
+    });
+    await db.collection('signingRequests').doc(requestId).update({ resultDocumentId: docRef.id });
+  } catch (e) {
+    alert(`שגיאה בהוספת המסמך לתיק של ${employeeName}: ` + e.message);
+  }
+}
+
+async function promoteSignedRoundFromTemplate(employeeId, roundId, employeeName) {
+  try {
+    const roundDoc = await db.collection('signingRounds').doc(roundId).get();
+    const r = roundDoc.data();
+    const url = await storage.ref(`signingRounds/${roundId}/signed.pdf`).getDownloadURL();
+    const blob = await (await fetch(url)).blob();
+
+    const docRef = db.collection('employees').doc(employeeId).collection('documents').doc();
+    const destPath = `documents/${employeeId}/${docRef.id}_signed.pdf`;
+    await storage.ref(destPath).put(blob);
+    await docRef.set({
+      name: `${r.templateName} (חתום - רב-חותמים)`, storagePath: destPath, contentType: 'application/pdf', sizeBytes: blob.size,
+      uploadedAt: firebase.firestore.FieldValue.serverTimestamp(), uploadedBy: currentUserName || currentUser.email
+    });
+    await db.collection('signingRounds').doc(roundId).update({ resultDocumentId: docRef.id });
+  } catch (e) {
+    alert(`שגיאה בהוספת המסמך לתיק של ${employeeName}: ` + e.message);
+  }
+}
+
+function resetToNewTemplate() {
+  currentTemplateId = null;
+  currentFields = [];
+  currentPdfBytes = null;
+  selectedFieldId = null;
+  setActiveTool(null);
+  document.getElementById('templateSelect').value = '';
+  document.getElementById('tplName').value = '';
+  document.getElementById('tplFile').value = '';
+  document.getElementById('deleteTemplateBtn').style.display = 'none';
+  document.getElementById('aiDetectBtn').style.display = 'none';
+  document.getElementById('tplHint').textContent = '';
+  document.getElementById('tplLayout').style.display = 'none';
+  document.getElementById('tplPages').innerHTML = '';
+  document.getElementById('tplMultiSign').checked = false;
+  document.getElementById('tplMultiSign').disabled = false;
+  document.getElementById('multiSignHint').style.display = 'none';
+  closeFieldForm();
+}
+
+async function onSelectTemplate() {
+  const id = document.getElementById('templateSelect').value;
+  if (!id) { resetToNewTemplate(); return; }
+  const tpl = templates.find(t => t.id === id);
+  currentTemplateId = id;
+  currentFields = JSON.parse(JSON.stringify(tpl.fields || []));
+  selectedFieldId = null;
+  document.getElementById('tplName').value = tpl.name;
+  document.getElementById('tplFile').value = '';
+  document.getElementById('deleteTemplateBtn').style.display = 'inline-block';
+  document.getElementById('aiDetectBtn').style.display = aiDetectConfigured() ? 'inline-block' : 'none';
+  document.getElementById('tplHint').textContent = 'טוען PDF...';
+  document.getElementById('tplMultiSign').checked = tpl.mode === 'multiSign';
+  document.getElementById('multiSignHint').style.display = tpl.mode === 'multiSign' ? 'block' : 'none';
+
+  try {
+    await refreshMultiSignLockState(id);
+    const url = await storage.ref(tpl.storagePath).getDownloadURL();
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    currentPdfBytes = new Uint8Array(await res.arrayBuffer());
+    document.getElementById('tplHint').textContent = '';
+    await renderAllPages();
+  } catch (e) {
+    console.error('onSelectTemplate failed:', e);
+    document.getElementById('tplHint').textContent = 'שגיאה בטעינת התבנית: ' + e.message;
+  }
+}
+
+function aiDetectConfigured() {
+  return typeof AI_DETECT_FUNCTION_URL !== 'undefined' && !AI_DETECT_FUNCTION_URL.startsWith('PASTE_');
+}
+
+const KNOWN_FIELD_TYPES = ['text', 'number', 'idNumber', 'phone', 'date', 'checkbox', 'signature'];
+
+async function runAiDetect() {
+  const hint = document.getElementById('tplHint');
+  const btn = document.getElementById('aiDetectBtn');
+  btn.disabled = true;
+  hint.style.color = '';
+  hint.textContent = 'מזהה שדות אוטומטי באמצעות AI... (עשוי לקחת כמה שניות)';
+  try {
+    const pages = pageCanvases.map((canvas, i) => ({
+      page: i, imageBase64: canvas.toDataURL('image/png').replace(/^data:image\/png;base64,/, '')
+    }));
+    const idToken = await currentUser.getIdToken();
+    const res = await fetch(AI_DETECT_FUNCTION_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + idToken },
+      body: JSON.stringify({ pages })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+
+    const detected = Array.isArray(data.fields) ? data.fields : [];
+    detected.forEach((f, i) => {
+      const type = KNOWN_FIELD_TYPES.includes(f.type) ? f.type : 'text';
+      const page = Math.max(0, Math.min(pageCanvases.length - 1, Math.round(f.page) || 0));
+      const clamp01 = (v) => Math.max(0, Math.min(1, Number(v) || 0));
+      currentFields.push({
+        id: newId(), type, page,
+        xPct: clamp01(f.xPct), yPct: clamp01(f.yPct), wPct: clamp01(f.wPct), hPct: clamp01(f.hPct),
+        label: (f.label && String(f.label).trim()) || (FIELD_TYPE_LABELS[type] + ' ' + (i + 1)),
+        autoFillFrom: '', locked: false, required: type === 'signature'
+      });
+    });
+    renderFieldBoxes();
+    hint.textContent = detected.length
+      ? `זוהו ${detected.length} שדות. בדקו/התאימו ואז לחצו "שמירת תבנית".`
+      : 'לא זוהו שדות. אפשר להוסיף שדות ידנית.';
+  } catch (e) {
+    hint.style.color = 'var(--danger)';
+    hint.textContent = 'שגיאה בזיהוי אוטומטי: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Disables the multi-sign toggle while a signing round is actively in
+// progress for this template, so the mode can't be flipped mid-flight.
+async function refreshMultiSignLockState(templateId) {
+  const snap = await db.collection('signingRequests')
+    .where('templateId', '==', templateId)
+    .where('mode', '==', 'multiSign')
+    .where('status', 'in', ['in_progress', 'completing'])
+    .limit(1).get();
+  document.getElementById('tplMultiSign').disabled = !snap.empty;
+}
+
+async function onFileChosen(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  currentPdfBytes = new Uint8Array(await file.arrayBuffer());
+  currentFields = [];
+  selectedFieldId = null;
+  await renderAllPages();
+}
+
+async function renderAllPages() {
+  await loadPdfJs();
+  const doc = await loadPdfDocument(currentPdfBytes.slice());
+  const pagesEl = document.getElementById('tplPages');
+  pagesEl.innerHTML = '';
+  pageInfos = [];
+  pageCanvases = [];
+  const cssWidth = Math.min(700, pagesEl.clientWidth || 700);
+
+  for (let i = 0; i < doc.numPages; i++) {
+    const page = await doc.getPage(i + 1);
+    const wrap = document.createElement('div');
+    wrap.className = 'tpl-page-wrap';
+    const canvas = document.createElement('canvas');
+    pageCanvases[i] = canvas;
+    wrap.appendChild(canvas);
+    const overlay = document.createElement('div');
+    overlay.className = 'tpl-overlay';
+    overlay.dataset.page = i;
+    wrap.appendChild(overlay);
+    pagesEl.appendChild(wrap);
+
+    const info = await renderPdfPageToCanvas(page, canvas, cssWidth);
+    pageInfos[i] = info;
+    overlay.style.width = info.cssWidth + 'px';
+    overlay.style.height = info.cssHeight + 'px';
+    wireOverlayDrawing(overlay, i);
+  }
+
+  document.getElementById('tplLayout').style.display = 'flex';
+  renderFieldBoxes();
+}
+
+function setActiveTool(type) {
+  activeFieldType = type;
+  document.querySelectorAll('.tool-btn').forEach(b => b.classList.toggle('active', b.dataset.type === type));
+  document.querySelectorAll('.tpl-overlay').forEach(o => o.classList.toggle('placing', !!type));
+}
+
+function wireOverlayDrawing(overlay, pageIndex) {
+  let drawing = null;
+  overlay.addEventListener('pointerdown', (e) => {
+    if (!activeFieldType) return; // pick a field type from the sidebar first
+    if (e.target !== overlay) return; // clicks on existing field boxes handled separately
+    const rect = overlay.getBoundingClientRect();
+    const draftEl = document.createElement('div');
+    draftEl.className = 'tpl-draft-rect';
+    overlay.appendChild(draftEl);
+    drawing = { startX: e.clientX - rect.left, startY: e.clientY - rect.top, page: pageIndex, draftEl };
+    overlay.setPointerCapture(e.pointerId);
+  });
+  overlay.addEventListener('pointermove', (e) => {
+    if (!drawing) return;
+    const rect = overlay.getBoundingClientRect();
+    const curX = e.clientX - rect.left, curY = e.clientY - rect.top;
+    const leftPx = Math.min(drawing.startX, curX), topPx = Math.min(drawing.startY, curY);
+    const widthPx = Math.abs(curX - drawing.startX), heightPx = Math.abs(curY - drawing.startY);
+    applyRectPx(drawing.draftEl, { leftPx, topPx, widthPx, heightPx });
+  });
+  overlay.addEventListener('pointerup', (e) => {
+    if (!drawing) return;
+    const type = activeFieldType;
+    const rect = overlay.getBoundingClientRect();
+    const endX = e.clientX - rect.left, endY = e.clientY - rect.top;
+    let leftPx = Math.min(drawing.startX, endX), topPx = Math.min(drawing.startY, endY);
+    let widthPx = Math.abs(endX - drawing.startX), heightPx = Math.abs(endY - drawing.startY);
+    drawing.draftEl.remove();
+    drawing = null;
+
+    // A plain click (no real drag) places a default-sized box for the chosen type.
+    if (widthPx < 10 || heightPx < 10) {
+      [widthPx, heightPx] = FIELD_DEFAULT_SIZE_PX[type];
+    }
+    const boxWidthPx = overlay.clientWidth, boxHeightPx = overlay.clientHeight;
+    leftPx = Math.min(Math.max(leftPx, 0), boxWidthPx - widthPx);
+    topPx = Math.min(Math.max(topPx, 0), boxHeightPx - heightPx);
+
+    const pct = pxRectToPct({ leftPx, topPx, widthPx, heightPx }, boxWidthPx, boxHeightPx);
+    const field = {
+      id: newId(), type, page: pageIndex,
+      xPct: pct.xPct, yPct: pct.yPct, wPct: pct.wPct, hPct: pct.hPct,
+      label: '', autoFillFrom: '', locked: false, required: type === 'signature'
+    };
+    currentFields.push(field);
+    selectedFieldId = field.id;
+    setActiveTool(null);
+    renderFieldBoxes();
+    openFieldForm(field);
+  });
+  overlay.addEventListener('pointercancel', () => {
+    if (!drawing) return;
+    drawing.draftEl.remove();
+    drawing = null;
+  });
+}
+
+function renderFieldBoxes() {
+  document.querySelectorAll('.tpl-overlay').forEach(overlay => {
+    overlay.querySelectorAll('.tpl-field-box').forEach(el => el.remove());
+  });
+  const overlays = document.querySelectorAll('.tpl-overlay');
+  currentFields.forEach(field => {
+    const overlay = overlays[field.page];
+    if (!overlay) return;
+    const rectPx = pctRectToPx(field, overlay.clientWidth, overlay.clientHeight);
+    const box = document.createElement('div');
+    box.className = 'tpl-field-box' + (field.locked ? ' locked' : '');
+    applyRectPx(box, rectPx);
+    box.textContent = (field.label || FIELD_TYPE_LABELS[field.type]) + (field.autoFillFrom ? ' 🔗' : '');
+    box.dataset.fieldId = field.id;
+
+    const handle = document.createElement('div');
+    handle.className = 'resize-handle';
+    box.appendChild(handle);
+
+    wireFieldBoxInteraction(box, field, overlay, handle);
+    overlay.appendChild(box);
+  });
+}
+
+function wireFieldBoxInteraction(box, field, overlay, handle) {
+  let mode = null; // 'move' | 'resize'
+  let startClientX, startClientY, startField;
+
+  function onDown(e, m) {
+    e.stopPropagation();
+    mode = m;
+    startClientX = e.clientX; startClientY = e.clientY;
+    startField = { ...field };
+    box.setPointerCapture(e.pointerId);
+  }
+  box.addEventListener('pointerdown', (e) => { if (e.target === handle) return; onDown(e, 'move'); });
+  handle.addEventListener('pointerdown', (e) => onDown(e, 'resize'));
+
+  box.addEventListener('pointermove', (e) => {
+    if (!mode) return;
+    const dxPct = (e.clientX - startClientX) / overlay.clientWidth;
+    const dyPct = (e.clientY - startClientY) / overlay.clientHeight;
+    if (mode === 'move') {
+      field.xPct = Math.max(0, Math.min(1 - field.wPct, startField.xPct + dxPct));
+      field.yPct = Math.max(0, Math.min(1 - field.hPct, startField.yPct + dyPct));
+    } else {
+      field.wPct = Math.max(0.02, startField.wPct + dxPct);
+      field.hPct = Math.max(0.015, startField.hPct + dyPct);
+    }
+    const rectPx = pctRectToPx(field, overlay.clientWidth, overlay.clientHeight);
+    applyRectPx(box, rectPx);
+  });
+
+  function onUp(e) {
+    if (!mode) return;
+    const moved = Math.abs(e.clientX - startClientX) > 3 || Math.abs(e.clientY - startClientY) > 3;
+    mode = null;
+    if (!moved) {
+      selectedFieldId = field.id;
+      openFieldForm(field);
+    }
+  }
+  box.addEventListener('pointerup', onUp);
+  box.addEventListener('pointercancel', onUp);
+}
+
+function openFieldForm(field) {
+  document.getElementById('noFieldSelected').style.display = 'none';
+  document.getElementById('fieldForm').style.display = 'block';
+  document.getElementById('fld_type').value = field.type;
+  document.getElementById('fld_label').value = field.label || '';
+  document.getElementById('fld_autofill').value = field.autoFillFrom || '';
+  document.getElementById('fld_locked').checked = !!field.locked;
+  document.getElementById('fld_required').checked = !!field.required;
+}
+
+function closeFieldForm() {
+  selectedFieldId = null;
+  document.getElementById('noFieldSelected').style.display = 'block';
+  document.getElementById('fieldForm').style.display = 'none';
+}
+
+function applyFieldForm() {
+  const field = currentFields.find(f => f.id === selectedFieldId);
+  if (!field) return;
+  field.type = document.getElementById('fld_type').value;
+  field.label = document.getElementById('fld_label').value.trim();
+  field.autoFillFrom = document.getElementById('fld_autofill').value;
+  field.locked = document.getElementById('fld_locked').checked || !!field.autoFillFrom;
+  field.required = document.getElementById('fld_required').checked;
+  renderFieldBoxes();
+}
+
+function deleteSelectedField() {
+  currentFields = currentFields.filter(f => f.id !== selectedFieldId);
+  closeFieldForm();
+  renderFieldBoxes();
+}
+
+async function saveTemplate() {
+  const name = document.getElementById('tplName').value.trim();
+  const hint = document.getElementById('tplHint');
+  if (!name) { hint.textContent = 'יש להזין שם לתבנית.'; return; }
+  if (!currentPdfBytes) { hint.textContent = 'יש לבחור קובץ PDF.'; return; }
+  if (!currentTemplateId && templates.length >= MAX_TEMPLATES) {
+    hint.textContent = `הגעת למכסה של ${MAX_TEMPLATES} תבניות. יש למחוק תבנית קיימת לפני הוספת תבנית חדשה.`;
+    return;
+  }
+
+  hint.textContent = 'שומר...';
+  try {
+    const templateId = currentTemplateId || newId();
+    const storagePath = `templates/${templateId}/master.pdf`;
+    const fileInput = document.getElementById('tplFile');
+    if (fileInput.files[0]) {
+      await storage.ref(storagePath).put(fileInput.files[0]);
+    }
+    const payload = {
+      name, storagePath, fields: currentFields, active: true,
+      mode: document.getElementById('tplMultiSign').checked ? 'multiSign' : 'single',
+      pageCount: pageInfos.length,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    };
+    if (!currentTemplateId) {
+      payload.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+      payload.createdBy = currentUserName || currentUser.email;
+    }
+    await db.collection('templates').doc(templateId).set(payload, { merge: true });
+
+    currentTemplateId = templateId;
+    hint.textContent = 'נשמר בהצלחה.';
+    await loadTemplatesList();
+    document.getElementById('templateSelect').value = templateId;
+    document.getElementById('deleteTemplateBtn').style.display = 'inline-block';
+  } catch (e) {
+    hint.textContent = 'שגיאה בשמירה: ' + e.message;
+  }
+}
+
+async function deleteTemplate() {
+  if (!currentTemplateId) return;
+  if (!confirm('למחוק את התבנית? בקשות חתימה שכבר נשלחו לא ייפגעו.')) return;
+  await db.collection('templates').doc(currentTemplateId).update({ active: false });
+  resetToNewTemplate();
+  await loadTemplatesList();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}

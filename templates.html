@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HR-Manager | תבניות לחתימה</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#2f6fed">
+<link rel="stylesheet" href="css/style.css">
+<style>
+  /* max-width+margin:auto centers the whole document+sidebar group on the
+     page as one block, instead of it stretching edge-to-edge with the
+     sidebar pinned to the far side and the document floating off-center. */
+  .tpl-layout { display: flex; gap: 16px; align-items: flex-start; max-width: 1000px; margin: 0 auto; }
+  .tpl-pages { flex: 1; min-width: 0; }
+  /* direction:ltr is deliberate - this wraps a canvas + an absolutely-positioned
+     overlay using plain left/top pixel math, unrelated to the page's RTL text
+     direction. Without it, the page is RTL, this div is a block wider than the
+     canvas inside it, so the canvas (a replaced element narrower than its
+     parent) renders flush against the *right* edge - but CSS left/top are
+     physical properties, not direction-aware, so the overlay (left:0/top:0)
+     stayed pinned to the true left edge instead, landing in the empty space
+     next to the PDF instead of on top of it. */
+  /* width:fit-content so this shrink-wraps to the canvas's actual rendered
+     width (capped at 700px in JS) instead of stretching block-full to fill
+     .tpl-pages's flex width - without it, on any screen wider than ~700px
+     the wrap left a big empty strip of its own white background next to the
+     document (reported as "the document sits in a giant white frame, the
+     page looks half-empty"). Kept as a normal block (not inline-block/table)
+     so multiple pages still stack one per line instead of flowing side by
+     side. Field math itself was never affected by this (percentages are
+     computed off the overlay's own clientWidth, which already matched the
+     canvas), but it looked broken and made the actual signable area unclear. */
+  .tpl-page-wrap { position: relative; width: fit-content; margin: 0 auto 16px; border: 1px solid var(--border); background: #fff; direction: ltr; }
+  .tpl-page-wrap canvas { display: block; }
+  .tpl-overlay { position: absolute; top: 0; left: 0; cursor: crosshair; }
+  .tpl-draft-rect { position: absolute; border: 2px dashed var(--primary); background: rgba(47,111,237,.15); pointer-events: none; box-sizing: border-box; }
+  .tpl-field-box {
+    position: absolute; border: 2px solid var(--primary); background: rgba(47,111,237,.12);
+    cursor: move; box-sizing: border-box; font-size: 11px; color: var(--primary-dark);
+    display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 2px;
+  }
+  .tpl-field-box.locked { border-color: var(--success); background: rgba(31,157,85,.12); color: var(--success); }
+  .tpl-field-box .resize-handle {
+    position: absolute; bottom: -5px; left: -5px; width: 12px; height: 12px;
+    background: var(--primary); border-radius: 50%; cursor: nwse-resize;
+  }
+  .tpl-sidebar { width: 260px; flex-shrink: 0; }
+  .tpl-field-form .field { margin-bottom: 8px; }
+  .back-link { font-size: 13px; }
+  .tool-btn-group { display: flex; flex-direction: column; gap: 6px; }
+  .tool-btn {
+    background: #fff; color: var(--text); border: 1px solid var(--border);
+    padding: 10px 12px; font-size: 14px; border-radius: 8px; cursor: pointer; text-align: right;
+  }
+  .tool-btn.active { background: linear-gradient(135deg, var(--primary), var(--primary-dark)); color: #fff; border-color: var(--primary); }
+  .tpl-overlay.placing { cursor: crosshair; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <img src="logo.png" alt="ניהול כוח אדם" class="topbar-logo">
+  <div>
+    <span class="who" id="whoAmI"></span>
+    <button class="btn small" id="logoutBtn">התנתקות</button>
+  </div>
+</header>
+
+<main style="padding:20px">
+  <p class="back-link"><a href="admin.html">← חזרה לניהול</a></p>
+
+  <div class="card">
+    <h2>תבניות מסמכים לחתימה</h2>
+    <div class="toolbar">
+      <select id="templateSelect" style="display:none"><option value="">-- תבנית חדשה --</option></select>
+      <div class="spacer"></div>
+      <button class="btn primary" id="newTemplateBtn">+ תבנית חדשה</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th>שם</th><th>סוג</th><th>עמודים</th><th>שדות</th><th>הגשות</th><th></th></tr>
+      </thead>
+      <tbody id="templatesTbody"></tbody>
+    </table>
+    <div class="empty-state" id="templatesEmpty" style="display:none">אין תבניות עדיין</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="field"><label>שם התבנית</label><input id="tplName" placeholder="לדוגמא: הסכם עבודה"></div>
+      <div class="field"><label>קובץ PDF</label><input type="file" id="tplFile" accept="application/pdf"></div>
+    </div>
+    <div class="field">
+      <label><input type="checkbox" id="tplMultiSign" style="width:auto"> מסמך רב-חותמים (כמה אנשים חותמים על אותו מסמך משותף, ברצף)</label>
+    </div>
+    <p class="hint" id="multiSignHint" style="display:none">כל שדה חתימה בתבנית הופך לתפקיד (למשל "עובד", "מנהל") - התווית של שדה החתימה היא שם התפקיד.</p>
+    <button class="btn primary" id="saveTemplateBtn">שמירת תבנית</button>
+    <button class="btn danger" id="deleteTemplateBtn" style="display:none">מחיקת תבנית</button>
+    <button class="btn" id="aiDetectBtn" style="display:none">זיהוי שדות אוטומטי (AI)</button>
+    <p class="hint" id="tplHint"></p>
+  </div>
+
+  <div class="modal-backdrop" id="submissionsModalBackdrop" style="display:none">
+    <div class="modal" style="max-width:640px">
+      <h2 id="submissionsModalTitle">הגשות</h2>
+      <ul class="list-mini" id="submissionsList"></ul>
+      <div class="modal-actions">
+        <button class="btn" id="closeSubmissionsModalBtn">סגירה</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="tpl-layout" id="tplLayout" style="display:none">
+    <div class="tpl-pages" id="tplPages"></div>
+    <div class="card tpl-sidebar">
+      <h2>הוספת שדה</h2>
+      <p class="muted">בחר/י סוג שדה, ואז גרור/י מלבן על העמוד כדי לסמן את מיקומו:</p>
+      <div class="tool-btn-group">
+        <button type="button" class="tool-btn" data-type="text">+ טקסט</button>
+        <button type="button" class="tool-btn" data-type="number">+ מספר</button>
+        <button type="button" class="tool-btn" data-type="date">+ תאריך</button>
+        <button type="button" class="tool-btn" data-type="idNumber">+ ת.ז.</button>
+        <button type="button" class="tool-btn" data-type="phone">+ טלפון נייד</button>
+        <button type="button" class="tool-btn" data-type="checkbox">+ תיבת סימון</button>
+        <button type="button" class="tool-btn" data-type="signature">+ חתימה</button>
+      </div>
+      <hr style="margin:14px 0;border:none;border-top:1px solid var(--border)">
+      <h2>שדה נבחר</h2>
+      <p class="muted" id="noFieldSelected">אין שדה נבחר. בחר/י סוג למעלה כדי להוסיף שדה חדש, או לחצ/י על שדה קיים בעמוד לעריכה.</p>
+      <div class="tpl-field-form" id="fieldForm" style="display:none">
+        <div class="field"><label>סוג שדה</label>
+          <select id="fld_type">
+            <option value="text">טקסט</option>
+            <option value="number">מספר</option>
+            <option value="date">תאריך</option>
+            <option value="idNumber">ת.ז.</option>
+            <option value="phone">טלפון נייד</option>
+            <option value="checkbox">תיבת סימון</option>
+            <option value="signature">חתימה</option>
+          </select>
+        </div>
+        <div class="field"><label>תווית (לזיהוי בלבד, ובמסמך רב-חותמים - שם התפקיד)</label><input id="fld_label"></div>
+        <div class="field"><label>מילוי אוטומטי מתיק העובד</label>
+          <select id="fld_autofill">
+            <option value="">-- מילוי ידני ע"י החותם --</option>
+            <option value="fullName">שם מלא</option>
+            <option value="firstName">שם פרטי</option>
+            <option value="lastName">שם משפחה</option>
+            <option value="idNumber">ת.ז.</option>
+            <option value="employeeNumber">מספר עובד</option>
+            <option value="position">תפקיד</option>
+            <option value="departmentName">מחלקה/סניף</option>
+            <option value="startDate">תאריך תחילת עבודה</option>
+            <option value="phone">טלפון</option>
+            <option value="email">אימייל</option>
+            <option value="address">כתובת</option>
+            <option value="birthDate">תאריך לידה</option>
+            <option value="today">תאריך שליחה</option>
+          </select>
+        </div>
+        <div class="field"><label><input type="checkbox" id="fld_locked" style="width:auto"> נעול (החותם לא יכול לערוך)</label></div>
+        <div class="field"><label><input type="checkbox" id="fld_required" style="width:auto"> שדה חובה</label></div>
+        <button class="btn primary small" id="applyFieldBtn">עדכון שדה</button>
+        <button class="btn danger small" id="deleteFieldBtn">מחיקת שדה</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-storage-compat.js"></script>
+<script src="js/firebase-init.js"></script>
+<script src="js/auth-common.js"></script>
+<script src="js/pdf-field-utils.js"></script>
+<script src="js/templates.js"></script>
+</body>
+</html>

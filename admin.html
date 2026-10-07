@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HR-Manager | ניהול</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#2f6fed">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <img src="logo.png" alt="ניהול כוח אדם" class="topbar-logo">
+  <div style="display:flex;align-items:center;gap:10px;position:relative">
+    <button class="btn small" id="notifBellBtn">🔔 <span id="notifCount" class="notif-count" style="display:none">0</span></button>
+    <div id="notifPanel" class="notif-panel" style="display:none">
+      <h3>התראות</h3>
+      <ul class="list-mini" id="notifList"></ul>
+    </div>
+    <span class="who" id="whoAmI"></span>
+    <button class="btn small" id="mfaOpenBtn">אימות דו-שלבי</button>
+    <button class="btn small" id="logoutBtn">התנתקות</button>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="tabs">
+    <button class="tab-btn active" data-view="employees">עובדים</button>
+    <button class="tab-btn" data-view="departments">מחלקות / סניפים</button>
+    <button class="tab-btn" data-view="fields">שדות מותאמים אישית</button>
+    <button class="tab-btn" data-view="users" id="usersTabBtn">משתמשי מערכת</button>
+    <button class="tab-btn" data-view="notifSettings" id="notifSettingsTabBtn" style="display:none">ניהול זמן להתראות</button>
+    <button class="tab-btn" data-view="bulkSend" id="bulkSendTabBtn" style="display:none">שליחה מרוכזת</button>
+    <button class="tab-btn" id="templatesLinkBtn" style="display:none">תבניות לחתימה</button>
+  </nav>
+
+  <main>
+    <!-- Employees view -->
+    <section id="view-employees">
+      <div class="card">
+        <div class="toolbar">
+          <input type="text" id="empSearch" placeholder="חיפוש לפי שם / ת.ז. / מספר עובד...">
+          <select id="empDeptFilter"><option value="">כל המחלקות</option></select>
+          <select id="empStatusFilter">
+            <option value="">כל הסטטוסים</option>
+            <option value="active">פעיל</option>
+            <option value="terminated">לא פעיל</option>
+          </select>
+          <div class="spacer"></div>
+          <button class="btn" id="seedDemoEmployeeBtn">יצירת עובד לדוגמה</button>
+          <button class="btn primary" id="addEmployeeBtn">+ עובד חדש</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th></th><th>מס' עובד</th><th>שם מלא</th><th>ת.ז.</th><th>תפקיד</th><th>מחלקה</th><th>סטטוס</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="employeesTbody"></tbody>
+        </table>
+        <div class="empty-state" id="employeesEmpty" style="display:none">אין עובדים להצגה</div>
+      </div>
+    </section>
+
+    <!-- Departments view -->
+    <section id="view-departments" style="display:none">
+      <div class="card">
+        <div class="toolbar">
+          <input type="text" id="newDeptName" placeholder="שם מחלקה / סניף חדש">
+          <button class="btn primary" id="addDeptBtn">הוספה</button>
+        </div>
+        <ul class="list-mini" id="deptList"></ul>
+      </div>
+    </section>
+
+    <!-- Custom fields view -->
+    <section id="view-fields" style="display:none">
+      <div class="card">
+        <div class="toolbar">
+          <input type="text" id="newFieldLabel" placeholder="שם השדה">
+          <select id="newFieldType">
+            <option value="text">טקסט</option>
+            <option value="number">מספר</option>
+            <option value="date">תאריך</option>
+            <option value="select">רשימה (בחירה)</option>
+            <option value="checkbox">תיבת סימון</option>
+          </select>
+          <input type="text" id="newFieldOptions" placeholder="אפשרויות (מופרדות בפסיק) - לרשימה בלבד" style="min-width:220px">
+          <button class="btn primary" id="addFieldBtn">הוספת שדה</button>
+        </div>
+        <ul class="list-mini" id="fieldDefList"></ul>
+      </div>
+    </section>
+
+    <!-- Users (admins/managers) view -->
+    <section id="view-users" style="display:none">
+      <div class="card">
+        <div class="toolbar">
+          <input type="text" id="newUserName" placeholder="שם מלא">
+          <input type="email" id="newUserEmail" placeholder="אימייל">
+          <select id="newUserRole">
+            <option value="manager">מנהל מחלקה</option>
+            <option value="superadmin">אדמין</option>
+          </select>
+          <button class="btn primary" id="addUserBtn">הוספת משתמש</button>
+        </div>
+        <p class="hint">לאדמין יש גישה לכל המחלקות. למנהל מחלקה יש לבחור מחלקות לאחר ההוספה. המשתמש יקבל אימייל לקביעת סיסמה.</p>
+        <ul class="list-mini" id="userList"></ul>
+      </div>
+    </section>
+
+    <!-- Bulk-send view -->
+    <section id="view-bulkSend" style="display:none">
+      <div class="card">
+        <h2>שליחה מרוכזת לחתימה</h2>
+        <p class="hint">לדוגמא: שליחת טופס 101 לכל העובדים הפעילים בתחילת שנה.</p>
+        <div class="toolbar">
+          <select id="bulkTemplateSelect"><option value="">-- בחירת תבנית --</option></select>
+          <select id="bulkDeptFilter"><option value="">כל המחלקות</option></select>
+          <button class="btn" id="bulkSelectAllBtn">בחירת הכל</button>
+          <button class="btn" id="bulkSelectNoneBtn">ניקוי בחירה</button>
+        </div>
+        <ul class="list-mini" id="bulkEmployeesList"></ul>
+        <div class="field" style="margin-top:10px"><label><input type="checkbox" id="bulkSendEmail" checked style="width:auto"> שליחה אוטומטית במייל לכל נמען (אם לא מסומן - רק יצירת קישורים להעתקה ידנית)</label></div>
+        <button class="btn primary" id="bulkSendBtn">שליחה לנבחרים</button>
+        <p class="hint" id="bulkSendHint"></p>
+        <div id="bulkSendResults"></div>
+      </div>
+    </section>
+
+    <!-- Notification settings view -->
+    <section id="view-notifSettings" style="display:none">
+      <div class="card">
+        <h2>כמה זמן מראש להתריע</h2>
+        <p class="hint">בפעמון ההתראות למעלה יופיעו אירועים קרובים לפי מספר הימים שנקבע כאן לכל סוג, ועד כמה ימים אחרי שעבר התאריך.</p>
+        <div class="row">
+          <div class="field"><label>ימי הולדת - ימים מראש</label><input type="number" id="ns_birthday" min="0"></div>
+          <div class="field"><label>סיום הסכם עבודה - ימים מראש</label><input type="number" id="ns_contractEnd" min="0"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>תזכורות נוספות (מענקים/העלאות/מותאם) - ימים מראש</label><input type="number" id="ns_custom" min="0"></div>
+          <div class="field"><label>הצגה גם עד כמה ימים אחרי שהתאריך עבר</label><input type="number" id="ns_overdue" min="0"></div>
+        </div>
+        <button class="btn primary" id="saveNotifSettingsBtn">שמירה</button>
+        <p class="hint" id="notifSettingsHint"></p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- MFA (two-factor, email-code based) modal -->
+<div class="modal-backdrop" id="mfaModalBackdrop" style="display:none">
+  <div class="modal" style="max-width:400px">
+    <h2>אימות דו-שלבי (מייל)</h2>
+
+    <div id="mfaNotConfiguredBlock" style="display:none">
+      <p class="hint">יש להגדיר תחילה שירות שליחת אימייל (EmailJS) במערכת לפני שניתן להפעיל אימות דו-שלבי - אחרת אין דרך לקבל את הקוד בכניסה הבאה.</p>
+    </div>
+
+    <div id="mfaEnabledBlock" style="display:none">
+      <p>אימות דו-שלבי במייל <strong>פעיל</strong> עבור חשבון זה.</p>
+      <button class="btn danger" id="mfaDisableBtn">ביטול אימות דו-שלבי</button>
+    </div>
+
+    <div id="mfaSetupStart" style="display:none">
+      <p class="hint">בכל כניסה למערכת תתבקש/י להזין גם קוד שיישלח לאימייל שלך. כדי לוודא שהקוד באמת מגיע, נשלח עכשיו קוד לבדיקה - יש להזין אותו כדי להפעיל בפועל.</p>
+      <button class="btn primary" id="mfaSendTestCodeBtn">שליחת קוד לבדיקה</button>
+    </div>
+    <div id="mfaSetupVerify" style="display:none">
+      <div class="field"><label>קוד שהתקבל במייל</label><input id="mfa_code" inputmode="numeric" maxlength="6"></div>
+      <button class="btn primary" id="mfaVerifyCodeBtn">אימות והפעלה</button>
+    </div>
+
+    <p class="error-msg" id="mfaHint"></p>
+    <div class="modal-actions">
+      <button class="btn" id="closeMfaModalBtn">סגירה</button>
+    </div>
+  </div>
+</div>
+
+<!-- Share signing link (shown once, right after a request/round is created) -->
+<div class="modal-backdrop" id="shareLinkModalBackdrop" style="display:none;z-index:60">
+  <div class="modal" style="max-width:480px">
+    <h2 id="shareLinkModalTitle">בקשת החתימה נוצרה</h2>
+    <p class="hint" id="shareLinkModalHint"></p>
+    <textarea id="shareLinkText" readonly rows="6" style="width:100%;font-family:inherit;font-size:13px;resize:vertical"></textarea>
+    <div class="modal-actions">
+      <button class="btn primary" id="copyShareLinkBtn">העתקת הכל</button>
+      <button class="btn" id="closeShareLinkModalBtn">סגירה</button>
+    </div>
+  </div>
+</div>
+
+<!-- Employee modal -->
+<div class="modal-backdrop" id="employeeModalBackdrop" style="display:none">
+  <div class="modal">
+    <h2 id="employeeModalTitle">עובד חדש</h2>
+    <div class="modal-tabs">
+      <button class="emp-tab-btn active" data-pane="personal">פרטים אישיים</button>
+      <button class="emp-tab-btn" data-pane="employment">תעסוקה</button>
+      <button class="emp-tab-btn" data-pane="custom">שדות מותאמים</button>
+      <button class="emp-tab-btn" data-pane="equipment">ציוד</button>
+      <button class="emp-tab-btn" data-pane="trainings">הכשרות</button>
+      <button class="emp-tab-btn" data-pane="reminders">תזכורות</button>
+      <button class="emp-tab-btn" data-pane="notes">הערות</button>
+      <button class="emp-tab-btn" data-pane="documents">מסמכים</button>
+      <button class="emp-tab-btn" data-pane="signing">בקשות חתימה</button>
+      <button class="emp-tab-btn" data-pane="portal">גישת פורטל</button>
+    </div>
+
+    <div class="modal-pane active" data-pane="personal">
+      <div style="display:flex;gap:16px;align-items:flex-start">
+        <div>
+          <img id="photoPreview" class="photo-preview" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='90' height='90'%3E%3Crect width='90' height='90' fill='%23e6e9ee'/%3E%3C/svg%3E">
+          <div style="margin-top:6px"><input type="file" id="photoInput" accept="image/*"></div>
+        </div>
+        <div style="flex:1">
+          <div class="row">
+            <div class="field"><label>שם פרטי</label><input id="f_firstName"></div>
+            <div class="field"><label>שם משפחה</label><input id="f_lastName"></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>ת.ז.</label><input id="f_idNumber"></div>
+            <div class="field"><label>תאריך לידה</label><input type="date" id="f_birthDate"></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>טלפון</label><input id="f_phone"></div>
+            <div class="field"><label>אימייל אישי</label><input type="email" id="f_email"></div>
+          </div>
+          <div class="field"><label>כתובת</label><input id="f_address"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-pane" data-pane="employment">
+      <div class="row">
+        <div class="field"><label>מספר עובד</label><input id="f_employeeNumber"></div>
+        <div class="field"><label>תפקיד</label><input id="f_position"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>מחלקה / סניף</label><select id="f_departmentId"></select></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>מנהל ישיר</label><input id="f_managerName"></div>
+        <div class="field"><label>סטטוס</label>
+          <select id="f_status"><option value="active">פעיל</option><option value="terminated">לא פעיל</option></select>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field"><label>תאריך תחילת עבודה</label><input type="date" id="f_startDate"></div>
+        <div class="field"><label>תאריך סיום (אם רלוונטי)</label><input type="date" id="f_endDate"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>סיום הסכם עבודה (לחוזים לתקופה קצובה)</label><input type="date" id="f_contractEndDate"></div>
+      </div>
+    </div>
+
+    <div class="modal-pane" data-pane="custom">
+      <div id="customFieldsContainer"></div>
+    </div>
+
+    <div class="modal-pane" data-pane="equipment">
+      <ul class="list-mini" id="equipmentList"></ul>
+      <div class="row" style="margin-top:10px">
+        <div class="field"><label>פריט</label><input id="eq_name"></div>
+        <div class="field"><label>תאריך מסירה</label><input type="date" id="eq_date"></div>
+        <div class="field"><label>הערה</label><input id="eq_notes"></div>
+      </div>
+      <button class="btn" id="addEquipmentBtn">הוספת פריט</button>
+    </div>
+
+    <div class="modal-pane" data-pane="trainings">
+      <ul class="list-mini" id="trainingsList"></ul>
+      <div class="row" style="margin-top:10px">
+        <div class="field"><label>שם ההכשרה</label><input id="tr_name"></div>
+        <div class="field"><label>תאריך</label><input type="date" id="tr_date"></div>
+        <div class="field"><label>תוקף עד</label><input type="date" id="tr_expiry"></div>
+      </div>
+      <button class="btn" id="addTrainingBtn">הוספת הכשרה</button>
+    </div>
+
+    <div class="modal-pane" data-pane="reminders">
+      <p class="hint">תזכורות מותאמות (למשל תאריך העלאת שכר או מענק) יופיעו בפעמון ההתראות למעלה. יום הולדת וסיום הסכם עבודה מחושבים אוטומטית מהלשוניות "פרטים אישיים" ו"תעסוקה".</p>
+      <ul class="list-mini" id="remindersList"></ul>
+      <div class="row" style="margin-top:10px">
+        <div class="field"><label>כותרת</label><input id="rm_title" placeholder="לדוגמא: מועד העלאת שכר"></div>
+        <div class="field"><label>תאריך</label><input type="date" id="rm_date"></div>
+        <div class="field"><label><input type="checkbox" id="rm_recurring" style="width:auto"> חוזר כל שנה (לפי יום וחודש)</label></div>
+      </div>
+      <button class="btn" id="addReminderBtn">הוספת תזכורת</button>
+    </div>
+
+    <div class="modal-pane" data-pane="notes">
+      <ul class="list-mini" id="notesList"></ul>
+      <div class="field" style="margin-top:10px"><label>הערה חדשה</label><textarea id="noteText" rows="3"></textarea></div>
+      <button class="btn" id="addNoteBtn">הוספת הערה</button>
+    </div>
+
+    <div class="modal-pane" data-pane="documents">
+      <ul class="list-mini" id="documentsList"></ul>
+      <div class="row" style="margin-top:10px">
+        <div class="field"><label>שם המסמך</label><input id="doc_name" placeholder="לדוגמא: הסכם עבודה חתום"></div>
+        <div class="field"><label>קובץ</label><input type="file" id="doc_file"></div>
+      </div>
+      <button class="btn" id="uploadDocumentBtn">העלאת מסמך</button>
+      <p class="hint" id="uploadDocumentHint"></p>
+    </div>
+
+    <div class="modal-pane" data-pane="signing">
+      <div class="toolbar">
+        <select id="signTemplateSelect"><option value="">-- בחירת תבנית --</option></select>
+      </div>
+
+      <div id="singleSignForm">
+        <div class="toolbar">
+          <input type="email" id="signRecipientEmail" placeholder="אימייל הנמען (רשות - רק לשליחה אוטומטית במייל)">
+          <button class="btn primary" id="sendForSignatureBtn">יצירת קישור לחתימה</button>
+        </div>
+      </div>
+
+      <div id="multiSignForm" style="display:none">
+        <p class="hint">מסמך רב-חותמים - יש להזין שם ואימייל לכל תפקיד:</p>
+        <div id="multiSignRoles"></div>
+        <button class="btn primary" id="startMultiSignRoundBtn">התחלת סבב חתימות חדש</button>
+      </div>
+
+      <p class="hint" id="sendForSignatureHint"></p>
+      <ul class="list-mini" id="signingRequestsList"></ul>
+    </div>
+
+    <div class="modal-pane" data-pane="portal">
+      <div id="portalStatusBlock"></div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn primary" id="saveEmployeeBtn">שמירה</button>
+      <button class="btn" id="closeEmployeeModalBtn">ביטול</button>
+      <button class="btn danger" id="deleteEmployeeBtn" style="display:none">מחיקת עובד</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-storage-compat.js"></script>
+<script src="js/firebase-init.js"></script>
+<script src="js/auth-common.js"></script>
+<script src="js/pdf-field-utils.js"></script>
+<script src="js/emailjs-config.js"></script>
+<script src="js/admin.js"></script>
+</body>
+</html>

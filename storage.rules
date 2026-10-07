@@ -1,0 +1,61 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() { return request.auth != null; }
+    function isOwnerEmail() { return isSignedIn() && request.auth.token.email == 'v.carmel@gmail.com'; }
+
+    function userDocPath() { return /databases/(default)/documents/users/$(request.auth.uid); }
+    function isAdminUser() { return isSignedIn() && firestore.exists(userDocPath()); }
+    function adminData() { return firestore.get(userDocPath()).data; }
+    function isSuperAdmin() { return isOwnerEmail() || (isAdminUser() && adminData().active == true && adminData().role == 'superadmin'); }
+    function isManagerOfDept(deptId) {
+      return isAdminUser() && adminData().active == true && adminData().role == 'manager' && deptId in adminData().departmentIds;
+    }
+    function isAdminOrManagerOfDept(deptId) { return isSuperAdmin() || isManagerOfDept(deptId); }
+
+    function employeeData(employeeId) { return firestore.get(/databases/(default)/documents/employees/$(employeeId)).data; }
+    function isEmployeeSelf(employeeId) {
+      return isSignedIn()
+        && employeeData(employeeId).uid == request.auth.uid
+        && employeeData(employeeId).portalActive != false;
+    }
+
+    match /documents/{employeeId}/{fileId} {
+      allow read: if isAdminOrManagerOfDept(employeeData(employeeId).departmentId) || isEmployeeSelf(employeeId);
+      allow write: if isAdminOrManagerOfDept(employeeData(employeeId).departmentId) && request.resource.size < 15 * 1024 * 1024;
+      allow delete: if isAdminOrManagerOfDept(employeeData(employeeId).departmentId);
+    }
+
+    // Master PDF for a reusable signing template. Any signed-in admin/manager
+    // AND the anonymous recipient (needs to render it to fill/sign) can read;
+    // only superadmin (who builds templates) can write.
+    match /templates/{templateId}/{fileName} {
+      allow read: if isSignedIn();
+      allow write: if isSuperAdmin() && request.resource.size < 15 * 1024 * 1024;
+    }
+
+    // Flattened signed PDF for one signing request. Write is gated on the
+    // matching Firestore signingRequests doc being OTP-verified and still
+    // 'sent' — mirrors the Firestore rule for the same submission step, so
+    // an anonymous recipient can only write their own already-verified copy.
+    function signingRequestData(requestId) { return firestore.get(/databases/(default)/documents/signingRequests/$(requestId)).data; }
+    match /signingRequests/{requestId}/{fileName} {
+      allow write: if signingRequestData(requestId).status == 'sent'
+        && signingRequestData(requestId).otpVerified == true
+        && request.resource.size < 15 * 1024 * 1024;
+      allow read: if isAdminOrManagerOfDept(employeeData(signingRequestData(requestId).employeeId).departmentId);
+    }
+
+    // Final flattened PDF for a completed multi-sign round. Write is gated on
+    // the round doc having just transitioned to 'completing' (the Firestore
+    // transaction already verified this is the signer who completed the last
+    // role) — mirrors the single-request pattern above.
+    function signingRoundData(roundId) { return firestore.get(/databases/(default)/documents/signingRounds/$(roundId)).data; }
+    match /signingRounds/{roundId}/{fileName} {
+      allow write: if signingRoundData(roundId).status == 'completing'
+        && request.resource.size < 15 * 1024 * 1024;
+      allow read: if isAdminOrManagerOfDept(employeeData(signingRoundData(roundId).employeeId).departmentId);
+    }
+  }
+}
