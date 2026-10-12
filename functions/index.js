@@ -10,7 +10,7 @@ admin.initializeApp();
 
 const GEMINI_API_KEY = defineSecret('GEMINI_API_KEY');
 const OWNER_EMAIL = 'v.carmel@gmail.com';
-const ALLOWED_ORIGINS = ['https://vcarmel-cell.github.io', 'https://hadarnts.next1.co.il'];
+const ALLOWED_ORIGINS = ['https://vcarmel-cell.github.io', 'https://hadarntz.next1.co.il'];
 // gemini-flash-latest is an alias Google keeps pointed at their current
 // "flash" model - chosen deliberately over a pinned model name (e.g.
 // gemini-2.5-flash), since pinned names get deprecated over time (hit this
